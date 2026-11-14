@@ -1,0 +1,26 @@
+--- a/crates/luatos-log/src/lib.rs
++++ b/crates/luatos-log/src/lib.rs
+@@ -1640,7 +1640,9 @@
+             let level = LogLevel::from_char(bytes[0] as char);
+             if !matches!(level, LogLevel::Unknown(_) | LogLevel::Raw) {
+                 let rest = &msg[2..];
+-                if let Some(space_pos) = rest.find(' ') {
++                // 模块名和正文之间可能是空格，也可能是制表符（老版本 EC618 固件的 log.info 用 \t 分隔参数），
++                // 只认空格时整行都会被当成模块名，正文为空
++                if let Some(space_pos) = rest.find([' ', '\t']) {
+                     let module = rest[..space_pos].to_string();
+                     let body = rest[space_pos + 1..].to_string();
+                     return (level, Some(module), body);
+@@ -2323,6 +2325,12 @@
+         let (level, _, msg) = parse_level_prefix("no prefix here");
+         assert_eq!(level, LogLevel::Info); // default
+         assert_eq!(msg, "no prefix here");
++
++        // 制表符分隔（Air780EG 老固件跑 mpu6050 示例）
++        let (level, module, msg) = parse_level_prefix("I/user.6050gyro\tgyro.x\t12\tgyro.y\t-3");
++        assert_eq!(level, LogLevel::Info);
++        assert_eq!(module.as_deref(), Some("user.6050gyro"));
++        assert_eq!(msg, "gyro.x\t12\tgyro.y\t-3");
+     }
+ 
+     /// Helper: 构造一个 0xA5..0xA5 帧 (含 escape 处理 + CRC16)

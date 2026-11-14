@@ -1,0 +1,73 @@
+diff --git a/crates/luatos-log/src/lib.rs b/crates/luatos-log/src/lib.rs
+index 4bc7f05..7220b61 100644
+--- a/crates/luatos-log/src/lib.rs
++++ b/crates/luatos-log/src/lib.rs
+@@ -962,14 +962,20 @@ impl Ec718LogDecoder {
+                 continue;
+             }
+ 
+-            // HDLC byte-stuffing: 0x7D XX → XX ^ 0x20
++            // 转义：EC718 固件把 0x7D 转成 `7D 01`、0x7E 转成 `7D 02`
++            // （Air780EHM + LuatOS V2056 实测：日志里的 '}' 收到的是 7D 01，'~' 是 7D 02）。
++            // 其他字节仍按标准 HDLC 处理（`7D XX` → XX ^ 0x20），兼容旧行为。
+             if byte == 0x7D {
+                 self.escape_next = true;
+                 continue;
+             }
+ 
+             if self.escape_next {
+-                self.frame_buf.push(byte ^ 0x20);
++                self.frame_buf.push(match byte {
++                    0x01 => 0x7D,
++                    0x02 => 0x7E,
++                    other => other ^ 0x20,
++                });
+                 self.escape_next = false;
+                 continue;
+             }
+@@ -2042,6 +2048,45 @@ mod tests {
+         assert_eq!(entries[0].device_time.as_deref(), Some("0.126"));
+     }
+ 
++    #[test]
++    fn ec718_decoder_ec718_escape() {
++        // 实测抓包：日志里的 "QQ}QQ~QQ]QQ" 收到的是 51 51 7D 01 51 51 7D 02 51 51 5D 51 51
++        let mut decoder = Ec718LogDecoder::new();
++        let mut frame = vec![0x7E];
++        frame.extend_from_slice(&1000u32.to_le_bytes());
++        frame.extend_from_slice(&0u32.to_le_bytes());
++        frame.extend_from_slice(&0u32.to_le_bytes());
++        frame.extend_from_slice(&[0x51, 0x51, 0x7D, 0x01, 0x51, 0x51, 0x7D, 0x02, 0x51, 0x51, 0x5D, 0x51, 0x51, 0x00]);
++        frame.push(0x7E);
++
++        let entries = decoder.feed(&frame);
++        assert_eq!(entries.len(), 1);
++        assert_eq!(entries[0].message, "QQ}QQ~QQ]QQ");
++    }
++
++    #[test]
++    fn ec718_decoder_json_payload() {
++        // 修复前 `{"type":"sync"}` 会被解成 `{"type":"sync"!`
++        let mut decoder = Ec718LogDecoder::new();
++        let mut frame = vec![0x7E];
++        frame.extend_from_slice(&1000u32.to_le_bytes());
++        frame.extend_from_slice(&0u32.to_le_bytes());
++        frame.extend_from_slice(&0u32.to_le_bytes());
++        for &b in br#"{"type":"sync"}"# {
++            match b {
++                0x7D => frame.extend_from_slice(&[0x7D, 0x01]),
++                0x7E => frame.extend_from_slice(&[0x7D, 0x02]),
++                _ => frame.push(b),
++            }
++        }
++        frame.push(0x00);
++        frame.push(0x7E);
++
++        let entries = decoder.feed(&frame);
++        assert_eq!(entries.len(), 1);
++        assert_eq!(entries[0].message, r#"{"type":"sync"}"#);
++    }
++
+     #[test]
+     fn ec718_decoder_multiple_frames() {
+         let mut decoder = Ec718LogDecoder::new();

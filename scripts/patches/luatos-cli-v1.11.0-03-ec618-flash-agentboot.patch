@@ -1,0 +1,404 @@
+diff --git a/crates/luatos-flash/src/ec718.rs b/crates/luatos-flash/src/ec718.rs
+index 791b893..3787184 100644
+--- a/crates/luatos-flash/src/ec718.rs
++++ b/crates/luatos-flash/src/ec718.rs
+@@ -29,6 +29,23 @@ use crate::{FlashProgress, ProgressCallback};
+ 
+ const AGENTBOOT_EC718M_USB: &[u8] = include_bytes!("../../../refs/origin_tools/ec_download/agentboot/ec718m_usb.bin");
+ const AGENTBOOT_EC718M_UART: &[u8] = include_bytes!("../../../refs/origin_tools/ec_download/agentboot/ec718m_uart.bin");
++// EC618（Air780E / Air780EG）的 AgentBoot，取自 FlashToolCLI 的 ec618_products。
++// 只在 .soc 没带 agentboot_*.bin 时使用（LuatOS 的 EC618 固件包一般自带 agentboot_usb.bin）。
++const AGENTBOOT_EC618_USB: &[u8] = include_bytes!("../../../refs/origin_tools/ec_download/product_sets/ec618_products/common_data/agentboot_usb/agentboot.bin");
++const AGENTBOOT_EC618_UART: &[u8] = include_bytes!("../../../refs/origin_tools/ec_download/product_sets/ec618_products/common_data/agentboot_uart/agentboot.bin");
++
++/// AgentBoot 是几十 KB 的程序。没装 git-lfs 就编译时，include_bytes! 拿到的是 130 字节左右的 LFS 指针文本，
++/// 下载给模组后模组会跑飞，表现为写第一个分区时 “Broken pipe”。在动设备之前拦下来。
++fn check_agentboot(data: &[u8], what: &str) -> Result<()> {
++    if data.starts_with(b"version https://git-lfs") || data.len() < 4096 {
++        bail!(
++            "AgentBoot ({what}) 无效：只有 {} 字节{}。luatos-cli 编译时没拿到 Git LFS 里的二进制文件，请重新编译",
++            data.len(),
++            if data.starts_with(b"version https://git-lfs") { "，内容是 Git LFS 指针" } else { "" }
++        );
++    }
++    Ok(())
++}
+ 
+ // ─── Protocol Constants ─────────────────────────────────────────────────────
+ 
+@@ -939,8 +956,69 @@ fn sys_reset(port: &mut dyn SerialPort) -> Result<()> {
+ 
+ // ─── SOC File Parsing Helpers ───────────────────────────────────────────────
+ 
++/// 从 .soc 里读出的刷机所需内容。
++struct SocPackage {
++    binpkg: BinpkgResult,
++    force_br: u32,
++    /// info.json 的 chip.type，如 "ec7xx" / "ec618"
++    chip_type: String,
++    /// .soc 自带的 AgentBoot（EC618 固件包带 agentboot_usb.bin，LuaTools 用的就是它）
++    agentboot_usb: Option<Vec<u8>>,
++    agentboot_uart: Option<Vec<u8>>,
++    /// .soc 里 config_*.ini 的 agbaud
++    agbaud: Option<u32>,
++}
++
++impl SocPackage {
++    fn is_ec618(&self) -> bool {
++        self.chip_type.eq_ignore_ascii_case("ec618")
++    }
++
++    /// 选 AgentBoot：.soc 自带的优先，其次按芯片用内置的。返回 (数据, 来源说明)。
++    fn agentboot(&self, port_type: Ec718PortType) -> Result<(&[u8], &'static str)> {
++        let (bundled, builtin, builtin_name) = match (self.is_ec618(), port_type) {
++            (true, Ec718PortType::Usb) => (&self.agentboot_usb, AGENTBOOT_EC618_USB, "内置 ec618_usb"),
++            (true, Ec718PortType::Uart) => (&self.agentboot_uart, AGENTBOOT_EC618_UART, "内置 ec618_uart"),
++            (false, Ec718PortType::Usb) => (&self.agentboot_usb, AGENTBOOT_EC718M_USB, "内置 ec718m_usb"),
++            (false, Ec718PortType::Uart) => (&self.agentboot_uart, AGENTBOOT_EC718M_UART, "内置 ec718m_uart"),
++        };
++        let (data, from) = match bundled {
++            Some(d) => (d.as_slice(), "SOC 自带"),
++            None => (builtin, builtin_name),
++        };
++        check_agentboot(data, from)?;
++        Ok((data, from))
++    }
++
++    /// AgentBoot 加载后使用的波特率（写进镜像头）。EC718 沿用 info.json 的 force_br；
++    /// EC618 按固件包里下载配置的 agbaud（官方配置是 921600）。
++    fn agent_baud(&self) -> u32 {
++        if self.is_ec618() {
++            self.agbaud.unwrap_or(921600)
++        } else {
++            self.force_br
++        }
++    }
++}
++
++/// 从 config_*.ini 文本里取 `agbaud = N`。
++fn ini_agbaud(text: &str) -> Option<u32> {
++    text.lines().find_map(|line| {
++        let line = line.trim();
++        if line.starts_with(';') || line.starts_with('#') {
++            return None;
++        }
++        let (k, v) = line.split_once('=')?;
++        if k.trim().eq_ignore_ascii_case("agbaud") {
++            v.trim().parse().ok()
++        } else {
++            None
++        }
++    })
++}
++
+ /// Extract binpkg from a 7z SOC archive and parse it.
+-fn extract_and_parse_soc(soc_path: &str) -> Result<(BinpkgResult, Option<Vec<u8>>, u32)> {
++fn extract_soc_package(soc_path: &str) -> Result<SocPackage> {
+     let tempdir = tempfile::tempdir().context("Create temp dir")?;
+     let temppath = tempdir.path();
+ 
+@@ -957,19 +1035,31 @@ fn extract_and_parse_soc(soc_path: &str) -> Result<(BinpkgResult, Option<Vec<u8>
+         .unwrap_or(0);
+ 
+     let force_br = info.pointer("/download/force_br").and_then(|v| v.as_str()).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
++    let chip_type = info.pointer("/chip/type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+ 
+     // Find and parse binpkg
+     let mut binpkg_result: Option<BinpkgResult> = None;
+     let mut script_data: Option<Vec<u8>> = None;
++    let mut agentboot_usb: Option<Vec<u8>> = None;
++    let mut agentboot_uart: Option<Vec<u8>> = None;
++    let mut agbaud: Option<u32> = None;
+ 
+     for entry in std::fs::read_dir(temppath)? {
+         let entry = entry?;
+         let fname = entry.file_name().to_string_lossy().to_string();
++        let lower = fname.to_ascii_lowercase();
+         if fname.ends_with(".binpkg") {
+             let fdata = std::fs::read(entry.path())?;
+             binpkg_result = Some(parse_binpkg(&fdata)?);
+         } else if fname.ends_with("script.bin") {
+             script_data = Some(std::fs::read(entry.path())?);
++        } else if lower == "agentboot_usb.bin" {
++            agentboot_usb = Some(std::fs::read(entry.path())?);
++        } else if lower == "agentboot_uart.bin" {
++            agentboot_uart = Some(std::fs::read(entry.path())?);
++        } else if lower.starts_with("config_") && lower.ends_with(".ini") && agbaud.is_none() {
++            let text = String::from_utf8_lossy(&std::fs::read(entry.path())?).to_string();
++            agbaud = ini_agbaud(&text);
+         }
+     }
+ 
+@@ -990,7 +1080,14 @@ fn extract_and_parse_soc(soc_path: &str) -> Result<(BinpkgResult, Option<Vec<u8>
+         }
+     }
+ 
+-    Ok((result, None, force_br))
++    Ok(SocPackage {
++        binpkg: result,
++        force_br,
++        chip_type,
++        agentboot_usb,
++        agentboot_uart,
++        agbaud,
++    })
+ }
+ 
+ /// Helper to extract a 7z SOC file.
+@@ -1025,6 +1122,31 @@ fn entry_to_burn_type(entry: &BinpkgEntry) -> Option<(BurnImageType, u8, u32)> {
+     }
+ }
+ 
++/// AP flash 的 XIP 映射基址。
++const AP_XIP_BASE: u32 = 0x800000;
++
++fn ap_raw_addr(addr: u32) -> u32 {
++    addr.checked_sub(AP_XIP_BASE).unwrap_or(addr)
++}
++
++/// EC618 的分区写法，照固件包里 config_ec618_usb.ini（LuaTools 调 FlashToolCLI 用的配置）：
++///   - BL / AP 写 AP flash，地址是不带 0x800000 的原始地址（0x4000 / 0x24000）
++///   - CP 在独立的 CP flash 上，从 0 开始（EC7xx 的 CP 在 AP flash 里，这是两者最大的区别）
++///   - 脚本按 flexfile 写 AP flash 的 script_addr（如 0x2CC000）
++///
++/// 配置里另有两份 RF 表（MergeRfTable_ec618.bin → CP flash 0xE7000 / 0xCE000），不在 binpkg 里，这里不写，保留模组上原有的。
++fn entry_to_burn_type_ec618(entry: &BinpkgEntry) -> Option<(BurnImageType, u8, u32)> {
++    if entry.name.eq_ignore_ascii_case("script") {
++        return Some((BurnImageType::FlexFile, STYPE_AP_FLASH, ap_raw_addr(entry.addr)));
++    }
++    match entry.image_type.trim().to_ascii_uppercase().as_str() {
++        "BL" => Some((BurnImageType::Bootloader, STYPE_AP_FLASH, ap_raw_addr(entry.addr))),
++        "AP" => Some((BurnImageType::Ap, STYPE_AP_FLASH, ap_raw_addr(entry.addr))),
++        "CP" => Some((BurnImageType::Cp, STYPE_CP_FLASH, 0)),
++        _ => None,
++    }
++}
++
+ // ─── Public API ─────────────────────────────────────────────────────────────
+ 
+ /// USB Boot mode VID/PID for EC718 series.
+@@ -1320,22 +1442,31 @@ pub fn flash_ec718(soc_path: &str, port: &str, on_progress: &ProgressCallback, c
+     on_progress(&FlashProgress::info("Preparing", 0.0, "Parsing SOC file..."));
+ 
+     // Parse SOC file
+-    let (mut binpkg, _script_data, force_br) = extract_and_parse_soc(soc_path)?;
++    let mut pkg = extract_soc_package(soc_path)?;
++    let is_ec618 = pkg.is_ec618();
++    let agent_baud = pkg.agent_baud();
++
++    // Determine port type and agentboot binary
++    let port_type = detect_port_type(port);
++    let (agentboot, agentboot_from) = pkg.agentboot(port_type).map(|(d, f)| (d.to_vec(), f))?;
++
++    let binpkg = &mut pkg.binpkg;
+     if let Some(overlay) = script_overlay {
+         let info = luatos_soc::read_soc_info(soc_path)?;
+         let script_addr = info.download.script_addr.as_deref().and_then(luatos_soc::parse_addr).unwrap_or(0) as u32;
+-        overlay_script_entry(&mut binpkg, overlay, script_addr)?;
++        overlay_script_entry(binpkg, overlay, script_addr)?;
+         on_progress(&FlashProgress::info("Preparing", 0.5, &format!("Using --script overlay ({} bytes)", overlay.len())));
+     }
+ 
+-    log::info!("EC718 chip: {}, {} entries, force_br={}", binpkg.chip, binpkg.entries.len(), force_br,);
+-
+-    // Determine port type and agentboot binary
+-    let port_type = detect_port_type(port);
+-    let agentboot = match port_type {
+-        Ec718PortType::Usb => AGENTBOOT_EC718M_USB,
+-        Ec718PortType::Uart => AGENTBOOT_EC718M_UART,
+-    };
++    log::info!(
++        "EC718 chip: {} (type {}), {} entries, agent_baud={}, agentboot={} ({} bytes)",
++        binpkg.chip,
++        pkg.chip_type,
++        binpkg.entries.len(),
++        agent_baud,
++        agentboot_from,
++        agentboot.len()
++    );
+ 
+     on_progress(&FlashProgress::info("Connecting", 1.0, &format!("Opening {} ({:?} mode)...", port, port_type)));
+ 
+@@ -1379,9 +1510,9 @@ pub fn flash_ec718(soc_path: &str, port: &str, on_progress: &ProgressCallback, c
+     }
+ 
+     // Stage 2: Download agentboot
+-    on_progress(&FlashProgress::info("AgentBoot", 6.0, &format!("Downloading agentboot ({} bytes)...", agentboot.len())));
++    on_progress(&FlashProgress::info("AgentBoot", 6.0, &format!("Downloading agentboot ({} bytes, {})...", agentboot.len(), agentboot_from)));
+ 
+-    burn_agboot(serial.as_mut(), agentboot, force_br)?;
++    burn_agboot(serial.as_mut(), &agentboot, agent_baud)?;
+ 
+     on_progress(&FlashProgress::info("AgentBoot", 15.0, "AgentBoot loaded"));
+ 
+@@ -1398,7 +1529,8 @@ pub fn flash_ec718(soc_path: &str, port: &str, on_progress: &ProgressCallback, c
+             bail!("Cancelled");
+         }
+ 
+-        let (img_type, stor_type, burn_addr) = match entry_to_burn_type(entry) {
++        let mapped = if is_ec618 { entry_to_burn_type_ec618(entry) } else { entry_to_burn_type(entry) };
++        let (img_type, stor_type, burn_addr) = match mapped {
+             Some(v) => v,
+             None => {
+                 log::warn!("Skipping unknown entry: {}", entry.name);
+@@ -1438,9 +1570,8 @@ pub fn flash_ec718(soc_path: &str, port: &str, on_progress: &ProgressCallback, c
+ pub fn flash_script_ec718(soc_path: &str, port: &str, script_data: &[u8], on_progress: &ProgressCallback, cancel: Arc<AtomicBool>) -> Result<()> {
+     on_progress(&FlashProgress::info("Preparing", 0.0, "Parsing SOC for script addr..."));
+ 
+-    // Parse SOC to get script_addr and force_br
+-    let (binpkg, _, force_br) = extract_and_parse_soc(soc_path)?;
+-    let _ = binpkg; // We only need script_addr from info.json
++    // Parse SOC to get agentboot / agent baud / chip type
++    let pkg = extract_soc_package(soc_path)?;
+ 
+     // Re-read info.json for script_addr
+     let info = luatos_soc::read_soc_info(soc_path)?;
+@@ -1451,14 +1582,27 @@ pub fn flash_script_ec718(soc_path: &str, port: &str, script_data: &[u8], on_pro
+     }
+ 
+     // Script addr in info.json is relative (e.g. 0x48E000).
+-    // Hardware needs absolute addr with 0x800000 base for AP flash.
+-    let burn_addr = if script_addr < 0x800000 { script_addr + 0x800000 } else { script_addr };
++    // EC7xx: hardware needs absolute addr with 0x800000 base for AP flash.
++    // EC618: 官方下载配置用原始地址（flexfile2 script.bin burnaddr = 0x2CC000）。
++    let burn_addr = if pkg.is_ec618() {
++        ap_raw_addr(script_addr)
++    } else if script_addr < 0x800000 {
++        script_addr + 0x800000
++    } else {
++        script_addr
++    };
+ 
+     let port_type = detect_port_type(port);
+-    let agentboot = match port_type {
+-        Ec718PortType::Usb => AGENTBOOT_EC718M_USB,
+-        Ec718PortType::Uart => AGENTBOOT_EC718M_UART,
+-    };
++    let (agentboot, agentboot_from) = pkg.agentboot(port_type)?;
++    let agent_baud = pkg.agent_baud();
++    log::info!(
++        "script flash: chip type {}, addr=0x{:X}, agent_baud={}, agentboot={} ({} bytes)",
++        pkg.chip_type,
++        burn_addr,
++        agent_baud,
++        agentboot_from,
++        agentboot.len()
++    );
+ 
+     on_progress(&FlashProgress::info("Connecting", 1.0, &format!("Opening {}...", port)));
+ 
+@@ -1490,8 +1634,8 @@ pub fn flash_script_ec718(soc_path: &str, port: &str, script_data: &[u8], on_pro
+         return Err(e).context("DLBOOT sync failed - module not in boot mode");
+     }
+ 
+-    on_progress(&FlashProgress::info("AgentBoot", 10.0, "Downloading agentboot..."));
+-    burn_agboot(serial.as_mut(), agentboot, force_br)?;
++    on_progress(&FlashProgress::info("AgentBoot", 10.0, &format!("Downloading agentboot ({} bytes, {})...", agentboot.len(), agentboot_from)));
++    burn_agboot(serial.as_mut(), agentboot, agent_baud)?;
+ 
+     if cancel.load(Ordering::Relaxed) {
+         bail!("Cancelled");
+@@ -1614,7 +1758,8 @@ mod tests {
+             eprintln!("Skipping: {} not found", soc);
+             return;
+         }
+-        let (result, _, force_br) = extract_and_parse_soc(soc).expect("parse SOC");
++        let pkg = extract_soc_package(soc).expect("parse SOC");
++        let (result, force_br) = (pkg.binpkg, pkg.force_br);
+         println!("Chip: {}", result.chip);
+         println!("Force BR: {}", force_br);
+         for entry in &result.entries {
+@@ -1624,6 +1769,93 @@ mod tests {
+         assert!(result.chip.contains("EC718"));
+     }
+ 
++    #[test]
++    fn embedded_agentboots_are_real_binaries() {
++        // 没装 git-lfs 编译时这里会是 130 字节左右的 LFS 指针
++        for (name, data, size) in [
++            ("ec718m_usb", AGENTBOOT_EC718M_USB, 40696),
++            ("ec718m_uart", AGENTBOOT_EC718M_UART, 47890),
++            ("ec618_usb", AGENTBOOT_EC618_USB, 44712),
++            ("ec618_uart", AGENTBOOT_EC618_UART, 43932),
++        ] {
++            check_agentboot(data, name).unwrap_or_else(|e| panic!("{name}: {e}"));
++            assert_eq!(data.len(), size, "{name}");
++        }
++    }
++
++    #[test]
++    fn check_agentboot_rejects_lfs_pointer() {
++        let ptr = b"version https://git-lfs.github.com/spec/v1\noid sha256:92a5\nsize 40696\n";
++        let err = check_agentboot(ptr, "test").unwrap_err().to_string();
++        assert!(err.contains("Git LFS"), "{err}");
++        assert!(check_agentboot(&[0u8; 100], "test").is_err());
++    }
++
++    #[test]
++    fn ini_agbaud_reads_value() {
++        assert_eq!(ini_agbaud("[config]\nline_0_com = COM46\nagbaud=921600\n"), Some(921600));
++        assert_eq!(ini_agbaud("[config]\n agbaud = 115200 \n"), Some(115200));
++        assert_eq!(ini_agbaud(";agbaud=1\n"), None);
++        assert_eq!(ini_agbaud("[config]\n"), None);
++    }
++
++    fn pkg_entry(name: &str, image_type: &str, addr: u32) -> BinpkgEntry {
++        BinpkgEntry {
++            name: name.into(),
++            addr,
++            flash_size: 0,
++            image_size: 4,
++            hash: String::new(),
++            image_type: image_type.into(),
++            data: Some(vec![0; 4]),
++        }
++    }
++
++    #[test]
++    fn ec618_partitions_follow_vendor_config() {
++        // Air780EG V1124 的 binpkg：BL 0x4000、AP 0x24000、CP 0（CP flash），脚本 0x2CC000
++        let bl = entry_to_burn_type_ec618(&pkg_entry("ap_bootloader", "BL", 0x4000)).unwrap();
++        assert_eq!(bl, (BurnImageType::Bootloader, STYPE_AP_FLASH, 0x4000));
++        let ap = entry_to_burn_type_ec618(&pkg_entry("ap", "AP", 0x24000)).unwrap();
++        assert_eq!(ap, (BurnImageType::Ap, STYPE_AP_FLASH, 0x24000));
++        let cp = entry_to_burn_type_ec618(&pkg_entry("cp-demo-flash", "CP", 0)).unwrap();
++        assert_eq!(cp, (BurnImageType::Cp, STYPE_CP_FLASH, 0));
++        let script = entry_to_burn_type_ec618(&pkg_entry("script", "AP", 0x2CC000)).unwrap();
++        assert_eq!(script, (BurnImageType::FlexFile, STYPE_AP_FLASH, 0x2CC000));
++        // 带 0x800000 映射基址的地址也还原成原始地址
++        let ap_xip = entry_to_burn_type_ec618(&pkg_entry("ap", "AP", 0x824000)).unwrap();
++        assert_eq!(ap_xip.2, 0x24000);
++        assert!(entry_to_burn_type_ec618(&pkg_entry("unknown", "XX", 0)).is_none());
++    }
++
++    #[test]
++    fn ec7xx_partition_mapping_unchanged() {
++        // EC7xx 的 CP 仍在 AP flash 里，地址去掉 0x800000
++        let cp = entry_to_burn_type(&pkg_entry("cp-demo-flash", "CP", 0x82D000)).unwrap();
++        assert_eq!(cp, (BurnImageType::Cp, STYPE_AP_FLASH, 0x2D000));
++        let bl = entry_to_burn_type(&pkg_entry("ap_bootloader", "BL", 0x803000)).unwrap();
++        assert_eq!(bl, (BurnImageType::Bootloader, STYPE_AP_FLASH, 0x803000));
++    }
++
++    /// 用真实的 EC618 固件包核对：LUATOS_EC618_SOC=/path/LuatOS-SoC_V1124_EC618.soc cargo test -p luatos-flash -- --ignored ec618_soc
++    #[test]
++    #[ignore = "需要 LUATOS_EC618_SOC 指向一个 EC618 .soc"]
++    fn ec618_soc_package() {
++        let soc = std::env::var("LUATOS_EC618_SOC").expect("LUATOS_EC618_SOC");
++        let pkg = extract_soc_package(&soc).expect("parse SOC");
++        assert!(pkg.is_ec618(), "chip type {}", pkg.chip_type);
++        assert_eq!(pkg.agent_baud(), 921600);
++        let (ab, from) = pkg.agentboot(Ec718PortType::Usb).expect("agentboot");
++        println!("agentboot {} bytes from {}", ab.len(), from);
++        assert_eq!(from, "SOC 自带");
++        for e in &pkg.binpkg.entries {
++            println!("  {} {} addr=0x{:X} size={} -> {:?}", e.name, e.image_type, e.addr, e.image_size, entry_to_burn_type_ec618(e));
++            assert!(entry_to_burn_type_ec618(e).is_some(), "{}", e.name);
++        }
++        let types: Vec<_> = pkg.binpkg.entries.iter().map(|e| e.image_type.as_str()).collect();
++        assert_eq!(types, ["BL", "AP", "CP"]);
++    }
++
+     #[test]
+     fn test_img_head_build() {
+         let data = vec![0xAA; 1024];

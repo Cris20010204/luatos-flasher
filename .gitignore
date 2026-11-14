@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+*.log
+.DS_Store
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+# 第三方二进制（由 scripts/fetch-luatos-cli.mjs 下载并校验）
+src-tauri/binaries/
+# luatos-cli 源码（scripts/build-luatos-cli.mjs 拉取并打补丁）
+.cache/
+__pycache__/
