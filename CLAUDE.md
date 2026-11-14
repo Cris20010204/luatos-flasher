@@ -44,6 +44,7 @@ LuatOS 模组的跨平台桌面工具（LuaTools 的替代品）：项目管理�
 
 ## 现状
 
+- **全流程只在 macOS（Apple 芯片）上跑通过；Windows 版从没编译和运行过**（代码有适配：按序列号归组 COM 口、系统标题栏、Ctrl 快捷键、MSI 中文语言），README 顶部和安装一节已注明。
 - 实机验证过（macOS）：Air780EHM（EC718）的下载脚本、下载底层和脚本（运行中的模组会被自动重启进下载模式）、USB 设备日志、重启模块、MQTT 收发；Air780EG（EC618）的下载底层和脚本。
 - 没在实机上验证过：清除 fs/kv、量产 / FOTA；EC718 非 M 系列（EC718P/U 等，如 Air780EP）仍用 ec718m 的 AgentBoot，FlashToolCLI 的配置里它们用的是 ec718_products 那一份。
 - 待做：CCM4211 / XT804 / BK7258 / UIS8910 的刷机和设备日志（要让用户选串口；日志模式 BK7258 是文本，其它是二进制，CCM4211 要 `--probe`）。

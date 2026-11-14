@@ -6,8 +6,12 @@
 
 <p align="center">
   给 LuatOS 模组用的跨平台桌面工具：建项目、写 Lua、一键下载到模组、看设备日志、调串口和 MQTT。<br>
-  macOS 和 Windows 通用，可以当作 LuaTools 的替代品。
+  面向 macOS 和 Windows，可以当作 LuaTools 的替代品。
 </p>
+
+> [!IMPORTANT]
+> **测试情况**：目前只在 **macOS（Apple 芯片）** 上跑通了全流程——建项目、写代码、下载脚本和底层固件、看设备日志、MQTT 调试，实机验证过 Air780EHM 和 Air780EG。
+> **Windows 版还没有测试过**：代码已经按 Windows 做了适配，但还没在 Windows 上编译和运行过，暂时没有 Windows 安装包。欢迎在 Windows 上试用并反馈。
 
 ![代码页和设备日志面板](docs/images/code.png)
 
@@ -54,8 +58,8 @@
 
 | 芯片 | 型号 | 现在能做的 |
 |---|---|---|
-| EC718 | Air780EHM / EHN / EHV / EHU / EGH / EGG / EGP / EPM / EP / EX2、Air700ECH / ECP、Air8000、Air1780H / P | 全部功能，USB 直连自动识别。实机验证过 Air780EHM |
-| EC618 | Air780E、Air780EG | 全部功能。实机验证过 Air780EG |
+| EC718 | Air780EHM / EHN / EHV / EHU / EGH / EGG / EGP / EPM / EP / EX2、Air700ECH / ECP、Air8000、Air1780H / P | 全部功能，USB 直连自动识别。实机验证过 Air780EHM（macOS） |
+| EC618 | Air780E、Air780EG | 全部功能。实机验证过 Air780EG（macOS） |
 | CCM4211 | Air1601 / 1602 / 1603 | 浏览和下载固件、建项目；刷机和设备日志还没做 |
 | XT804 | Air6208 | 同上 |
 | BK7258 | Air8101 | 同上 |
@@ -65,12 +69,19 @@
 
 ## 安装
 
-**直接下载**：到本仓库的 [Releases](https://github.com/Cris20010204/luatos-flasher/releases) 页面下载安装包（如果已经发布）。
+| 系统 | 状态 | 怎么装 |
+|---|---|---|
+| macOS（Apple 芯片，M1 及以后） | ✅ 全流程测试通过 | 到 [Releases](https://github.com/Cris20010204/luatos-flasher/releases) 下载 `LuatOS-Flasher_<版本>_macos_arm64.dmg` |
+| macOS（Intel 芯片） | ⚠️ 没有测试过 | 暂无安装包，需要[自己编译](#从源码编译)（打通用包的方法见下文） |
+| Windows 10 / 11 | ⚠️ 没有测试过 | 暂无安装包，需要在 Windows 上[自己编译](#从源码编译) |
 
-- macOS：打开 `.dmg`，把「LuatOS 烧录器」拖进「应用程序」。安装包没有苹果开发者签名，第一次打开会被系统拦下，到「系统设置 → 隐私与安全性」点「仍要打开」。
-- Windows：运行 `.msi` 或 `.exe` 安装包。没有代码签名证书，SmartScreen 提示时点「更多信息 → 仍要运行」。模组可能要先装合宙的 USB 驱动。Windows 版目前还没有在真机上完整测试过，遇到问题欢迎反馈。
+**macOS**：打开 `.dmg`，把「LuatOS 烧录器」拖进「应用程序」。安装包没有苹果开发者签名，第一次打开会被系统拦下，到「系统设置 → 隐私与安全性」点「仍要打开」。如果提示“已损坏，无法打开”，在终端运行：
 
-**自己编译**：见[从源码编译](#从源码编译)。
+```bash
+xattr -dr com.apple.quarantine "/Applications/LuatOS 烧录器.app"
+```
+
+**Windows**（未测试）：编译出的 `.msi` 或 `.exe` 安装包没有代码签名证书，SmartScreen 提示时点「更多信息 → 仍要运行」。模组可能要先装合宙的 USB 驱动。在 Windows 上遇到问题，欢迎提 Issue。
 
 ## 使用教程
 
@@ -165,7 +176,7 @@
 **设备日志打开了但是没有内容**
 确认模组在「运行中」，日志模式选「4G 模组 USB 打印」。模组的 USB 日志口输出的是二进制，用「通用串口打印」打开只会是空白或乱码。
 
-**Windows 上识别不到模组**
+**Windows 上识别不到模组**（Windows 版还没测试过）
 安装合宙的 USB 驱动，到合宙资料中心 [docs.openluat.com](https://docs.openluat.com/) 搜索“USB 驱动”。
 
 **MQTT 连接的密码存在哪里**
